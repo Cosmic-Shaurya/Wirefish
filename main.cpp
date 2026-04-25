@@ -170,6 +170,161 @@ public:
     }
 };
 
+// ==================== L3 structures ====================
+
+using IPv4Addr = array<uint8_t, 4>;
+using IPv6Addr = array<uint8_t, 16>;
+
+// IP protocol numbers (the [protocol] field in IPv4, [next header] for IPv6)
+enum class IPProto : uint8_t {
+    ICMP = 1,
+    TCP = 6,
+    UDP = 17,
+    ICMPv6 = 58,
+    Unknown = 0xFF
+};
+
+// holds either an IPv4 or IPv6 address
+struct IPAddr {
+    bool is_v6 = false;
+    IPv4Addr v4 {};
+    IPv6Addr v6 {};
+
+    static IPAddr from_v4(const uint8_t* p) {
+        IPAddr a; a.is_v6 = false;
+        memcpy(a.v4.data(), p, 4);
+        return a;
+    }
+
+    static IPAddr from_v6(const uint8_t* p) {
+        IPAddr a; a.is_v6 = true;
+        memcpy(a.v6.data(), p, 16);
+        return a;
+    }
+};
+
+struct L3Info {
+    optional<IPAddr> src_ip;
+    optional<IPAddr> dst_ip;
+    IPProto proto;
+    uint8_t ttl; // called hop limit for ipv6
+    uint16_t total_len; // datagram length in bytes
+    size_t header_len;
+};
+
+// base class for network-layer parsers
+struct L3Parser {
+    virtual optional<L3Info> parse(const uint8_t* pkt, size_t len) const = 0;
+    virtual ~L3Parser() = default;
+};
+
+/*
+IPv4 header:
+[ver+hdr_len:1][service_type:1][total_len:2][id:2][flags+frag:2] (flags -> 3 bits, frag -> 13 bits)
+[ttl:1][protocol:1][checksum:2][src:4][dst:4]
+[header options: variable number of 32 bit words]
+[data]
+*/
+struct IPv4L3Parser : L3Parser {
+    optional<L3Info> parse(const uint8_t* pkt, size_t len) const override {
+        if (len < 20) return nullopt;
+
+        uint8_t hdr_len = (pkt[0] & 0x0F); // lower nibble of first byte
+        size_t  hdr = static_cast<size_t>(hdr_len) * 4;
+        if (hdr < 20 || len < hdr) return nullopt;
+
+        L3Info info;
+        info.header_len = hdr;
+        info.total_len = read_u16_be(pkt + 2); 
+        info.ttl = pkt[8];
+        info.proto = static_cast<IPProto>(pkt[9]);
+        info.src_ip = IPAddr::from_v4(pkt + 12);
+        info.dst_ip = IPAddr::from_v4(pkt + 16);
+        return info;
+    }
+};
+
+/*
+IPv6 header:
+[ver+tc+flow:4][payload_len:2][next_header:1][hop_limit:1][src:16][dst:16]
+*/
+struct IPv6L3Parser : L3Parser {
+
+    optional<L3Info> parse(const uint8_t* pkt, size_t len) const override {
+        if (len < 40) return nullopt;
+
+        L3Info info;
+
+        uint8_t next = pkt[6]; // next header
+        size_t offset = 40; // how much to jump to reach actual L4 header
+
+        while (true) {
+            // check if it's an extension header
+            bool is_ext = (
+                next == 0  || // Hop-by-Hop
+                next == 43 || // Routing
+                next == 44 || // Fragment
+                next == 51 || // AH
+                next == 60    // Destination Options
+            );
+
+            if (!is_ext) break; // then it must be L4 header
+
+            if (offset + 2 > len) return nullopt;
+
+            uint8_t hdr_next = pkt[offset];
+            size_t ext_size = 0;
+
+            if (next == 44) { // Fragment
+                ext_size = 8;
+            } 
+            else if (next == 51) { // AH
+                uint8_t payload_len = pkt[offset + 1];
+                ext_size = (payload_len + 2) * 4;
+            } 
+            else {
+                uint8_t hdr_len = pkt[offset + 1];
+                ext_size = (hdr_len + 1) * 8;
+            }
+
+            if (offset + ext_size > len) return nullopt;
+
+            offset += ext_size;
+            next = hdr_next;
+        }
+
+        if (next == 50) { // Encapsulating Security Payload
+            info.proto = IPProto::Unknown;
+        }
+        else {
+            info.proto = static_cast<IPProto>(next);
+        }
+
+        info.header_len = offset;
+        info.total_len = 40 + read_u16_be(pkt + 4);
+        info.ttl = pkt[7];
+        info.src_ip = IPAddr::from_v6(pkt + 8);
+        info.dst_ip = IPAddr::from_v6(pkt + 24);
+
+        return info;
+    }
+};
+class L3ParserRegistry {
+    unordered_map<uint16_t, unique_ptr<L3Parser>> parsers;
+
+public:
+    L3ParserRegistry() {
+        parsers[static_cast<uint16_t>(EtherProto::IPv4)] = make_unique<IPv4L3Parser>();
+        parsers[static_cast<uint16_t>(EtherProto::IPv6)] = make_unique<IPv6L3Parser>();
+    }
+
+    optional<L3Info> parse(EtherProto proto, const uint8_t* pkt, size_t len) const {
+        auto it = parsers.find(static_cast<uint16_t>(proto));
+        if (it == parsers.end()) return nullopt;
+        return it->second->parse(pkt, len);
+    }
+};
+
 // ==================== Packet Capture ====================
 
 class PacketSource {
@@ -242,6 +397,7 @@ public:
     double time;
     int packet_id;
     optional<L2Info> l2; // populated after stripL2(), empty until then
+    optional<L3Info> l3; // populated after stripL3(), empty until then
 
     Packet(const uint8_t* packet_ptr, size_t packet_size, double time, int packet_id) {
         data.assign(packet_ptr, packet_ptr + packet_size);
@@ -256,6 +412,17 @@ public:
 
         // erase exactly the header bytes from the front
         data.erase(data.begin(), data.begin() + l2->header_len);
+    }
+
+    // Parses the L3 header, stores metadata in l3, then erases those bytes from data so data begins at the L4 payload.
+    // Must be called after stripL2() so that data starts at the IP header.
+    void stripL3(const L3ParserRegistry& registry) {
+        if (!l2) return; // need L2 info to know which L3 proto to parse
+
+        l3 = registry.parse(l2->proto, data.data(), data.size());
+        if (!l3) return;
+
+        data.erase(data.begin(), data.begin() + l3->header_len);
     }
 };
 
@@ -277,6 +444,42 @@ static void print_mac(const optional<MacAddr>& mac, const char* label) {
     }
 }
 
+static void print_ip(const optional<IPAddr>& ip, const char* label) {
+    cout << label << ": ";
+    if (!ip) {
+        cout << "N/A";
+        return;
+    }
+
+    const char hex[16] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+
+    if (!ip->is_v6) {
+        // dotted-decimal
+        for (int i = 0; i < 4; i++) {
+            if (i) cout << '.';
+            cout << static_cast<int>(ip->v4[i]);
+        }
+    }
+    else {
+        // colon-hex groups
+        for (int i = 0; i < 16; i += 2) {
+            if (i) cout << ':';
+            cout << hex[(ip->v6[i] >> 4) & 0xF] << hex[ip->v6[i] & 0xF]
+                 << hex[(ip->v6[i+1] >> 4) & 0xF] << hex[ip->v6[i+1] & 0xF];
+        }
+    }
+}
+
+static const char* proto_name(IPProto p) {
+    switch (p) {
+        case IPProto::ICMP: return "ICMP";
+        case IPProto::TCP: return "TCP";
+        case IPProto::UDP: return "UDP";
+        case IPProto::ICMPv6: return "ICMPv6";
+        default: return "?";
+    }
+}
+
 double now() {
     return chrono::duration<double>(
         chrono::system_clock::now().time_since_epoch()
@@ -287,12 +490,13 @@ double now() {
 
 int main() {
     PacketSource pkt_src;
-    L2ParserRegistry registry;
+    L2ParserRegistry l2_registry;
+    L3ParserRegistry l3_registry;
 
     const uint8_t* data;
     size_t size;
 
-    int dlt = pkt_src.getLinkType();
+    int dlt = pkt_src.getLinkType(); // data link type will be the same for all packets on a given interface
     int packet_id = 1;
     double start = now();
 
@@ -304,16 +508,30 @@ int main() {
             cout << "Packet (" << size << " bytes) received at " << now() - start << " seconds";
 
             Packet pkt(data, size, now() - start, packet_id++);
-            pkt.stripL2(registry, dlt);
+            pkt.stripL2(l2_registry, dlt);
+            pkt.stripL3(l3_registry);
 
             if (pkt.l2) {
                 cout << " | ";
                 print_mac(pkt.l2->dst_mac, "dst");
                 cout << "  ";
                 print_mac(pkt.l2->src_mac, "src");
-                cout << " | L3 payload: " << pkt.data.size() << " bytes";
-            } else {
+            } 
+            else {
                 cout << " | unknown link type " << dlt;
+            }
+
+            if (pkt.l3) {
+                cout << " | ";
+                print_ip(pkt.l3->src_ip, "src");
+                cout << "  ";
+                print_ip(pkt.l3->dst_ip, "dst");
+                cout << " | proto: " << proto_name(pkt.l3->proto)
+                     << " ttl: " << static_cast<int>(pkt.l3->ttl)
+                     << " | L4 payload: " << pkt.data.size() << " bytes";
+            } 
+            else {
+                cout << " | no L3";
             }
 
             packets.push_back(pkt);
