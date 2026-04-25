@@ -46,6 +46,17 @@ enum class EtherProto : uint16_t {
     Unknown = 0xFFFF
 };
 
+// convert 16-bit number to EtherProto
+static EtherProto to_ether_proto(uint16_t v) {
+    switch (v) {
+        case 0x0800: return EtherProto::IPv4;
+        case 0x0806: return EtherProto::ARP;
+        case 0x86DD: return EtherProto::IPv6;
+        case 0x8100: return EtherProto::VLAN;
+        default:     return EtherProto::Unknown;
+    }
+}
+
 struct L2Info {
     optional<MacAddr> src_mac;
     optional<MacAddr> dst_mac;
@@ -91,7 +102,7 @@ struct EthernetParser : L2Parser {
         otherwise, it is an IEEE 802.3 frame. etype represents the length of the payload.
         */
 
-        info.proto = (etype >= 0x0600) ? static_cast<EtherProto>(etype) : EtherProto::Unknown;
+        info.proto = (etype >= 0x0600) ? to_ether_proto(etype) : EtherProto::Unknown;
         
         return info;
     }
@@ -110,7 +121,7 @@ struct LinuxCookedParser : L2Parser {
         if (addr_len == 6)
             info.src_mac = read_mac(pkt + 6);
 
-        info.proto = static_cast<EtherProto>(read_u16_be(pkt + 14));
+        info.proto = to_ether_proto(read_u16_be(pkt + 14));
         return info;
     }
 };
@@ -184,6 +195,17 @@ enum class IPProto : uint8_t {
     Unknown = 0xFF
 };
 
+// convert protocol number to IPProto
+static IPProto to_ip_proto(uint8_t v) {
+    switch (v) {
+        case 1:  return IPProto::ICMP;
+        case 6:  return IPProto::TCP;
+        case 17: return IPProto::UDP;
+        case 58: return IPProto::ICMPv6;
+        default: return IPProto::Unknown;
+    }
+}
+
 // holds either an IPv4 or IPv6 address
 struct IPAddr {
     bool is_v6 = false;
@@ -237,7 +259,7 @@ struct IPv4L3Parser : L3Parser {
         info.header_len = hdr;
         info.total_len = read_u16_be(pkt + 2); 
         info.ttl = pkt[8];
-        info.proto = static_cast<IPProto>(pkt[9]);
+        info.proto = to_ip_proto(pkt[9]);
         info.src_ip = IPAddr::from_v4(pkt + 12);
         info.dst_ip = IPAddr::from_v4(pkt + 16);
         return info;
@@ -297,7 +319,7 @@ struct IPv6L3Parser : L3Parser {
             info.proto = IPProto::Unknown;
         }
         else {
-            info.proto = static_cast<IPProto>(next);
+            info.proto = to_ip_proto(next);
         }
 
         info.header_len = offset;
@@ -417,7 +439,7 @@ public:
     // Parses the L3 header, stores metadata in l3, then erases those bytes from data so data begins at the L4 payload.
     // Must be called after stripL2() so that data starts at the IP header.
     void stripL3(const L3ParserRegistry& registry) {
-        if (!l2) return; // need L2 info to know which L3 proto to parse
+        if (!l2) return;
 
         l3 = registry.parse(l2->proto, data.data(), data.size());
         if (!l3) return;
