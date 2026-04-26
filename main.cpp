@@ -253,7 +253,7 @@ struct IPv4L3Parser : L3Parser {
         if (len < 20) return nullopt;
 
         uint8_t hdr_len = (pkt[0] & 0x0F); // lower nibble of first byte
-        size_t  hdr = static_cast<size_t>(hdr_len) * 4;
+        size_t hdr = static_cast<size_t>(hdr_len) * 4;
         if (hdr < 20 || len < hdr) return nullopt;
 
         L3Info info;
@@ -332,6 +332,7 @@ struct IPv6L3Parser : L3Parser {
         return info;
     }
 };
+
 class L3ParserRegistry {
     unordered_map<uint16_t, unique_ptr<L3Parser>> parsers;
 
@@ -353,7 +354,7 @@ public:
 // base class - holds the protocol tag
 struct L4Info {
     IPProto protocol;
-    size_t  header_len = 0;
+    size_t header_len = 0;
 
     explicit L4Info(IPProto p) : protocol(p) {}
     virtual ~L4Info() = default;
@@ -371,15 +372,15 @@ struct TcpL4Info : L4Info {
     uint32_t seq;
     uint32_t ack;
     uint16_t window;
-    uint8_t  flags; // CWR ECE URG ACK PSH RST SYN FIN (high to low bit)
+    uint8_t flags; // CWR ECE URG ACK PSH RST SYN FIN (high to low bit)
 
     // flag accessors
-    bool fin()  const { return flags & 0x01; }
-    bool syn()  const { return flags & 0x02; }
-    bool rst()  const { return flags & 0x04; }
-    bool psh()  const { return flags & 0x08; }
+    bool fin()   const { return flags & 0x01; }
+    bool syn()   const { return flags & 0x02; }
+    bool rst()   const { return flags & 0x04; }
+    bool psh()   const { return flags & 0x08; }
     bool ack_f() const { return flags & 0x10; }
-    bool urg()  const { return flags & 0x20; }
+    bool urg()   const { return flags & 0x20; }
 
     TcpL4Info() : L4Info(IPProto::TCP) {}
 };
@@ -434,17 +435,17 @@ struct TcpL4Parser : L4Parser {
         if (len < 20) return nullptr;
 
         uint8_t data_offset = (pkt[12] >> 4); // upper nibble of byte 12
-        size_t  hdr = static_cast<size_t>(data_offset) * 4;
+        size_t hdr = static_cast<size_t>(data_offset) * 4;
         if (hdr < 20 || len < hdr) return nullptr;
 
         auto info = make_unique<TcpL4Info>();
         info->header_len = hdr;
-        info->src_port   = read_u16_be(pkt + 0);
-        info->dst_port   = read_u16_be(pkt + 2);
-        info->seq        = read_u32_be(pkt + 4);
-        info->ack        = read_u32_be(pkt + 8);
-        info->flags      = pkt[13];
-        info->window     = read_u16_be(pkt + 14);
+        info->src_port = read_u16_be(pkt + 0);
+        info->dst_port = read_u16_be(pkt + 2);
+        info->seq = read_u32_be(pkt + 4);
+        info->ack = read_u32_be(pkt + 8);
+        info->flags = pkt[13];
+        info->window = read_u16_be(pkt + 14);
         return info;
     }
 };
@@ -455,9 +456,9 @@ struct UdpL4Parser : L4Parser {
 
         auto info = make_unique<UdpL4Info>();
         info->header_len = 8;
-        info->src_port   = read_u16_be(pkt + 0);
-        info->dst_port   = read_u16_be(pkt + 2);
-        info->length     = read_u16_be(pkt + 4);
+        info->src_port = read_u16_be(pkt + 0);
+        info->dst_port = read_u16_be(pkt + 2);
+        info->length = read_u16_be(pkt + 4);
         return info;
     }
 };
@@ -468,10 +469,10 @@ struct IcmpL4Parser : L4Parser {
 
         auto info = make_unique<IcmpL4Info>();
         info->header_len = 8;
-        info->type       = pkt[0];
-        info->code       = pkt[1];
-        info->checksum   = read_u16_be(pkt + 2);
-        info->rest       = read_u32_be(pkt + 4);
+        info->type = pkt[0];
+        info->code = pkt[1];
+        info->checksum = read_u16_be(pkt + 2);
+        info->rest = read_u32_be(pkt + 4);
         return info;
     }
 };
@@ -482,10 +483,10 @@ struct ICMPv6L4Parser : L4Parser {
 
         auto info = make_unique<ICMPv6L4Info>();
         info->header_len = 8;
-        info->type       = pkt[0];
-        info->code       = pkt[1];
-        info->checksum   = read_u16_be(pkt + 2);
-        info->rest       = read_u32_be(pkt + 4);
+        info->type = pkt[0];
+        info->code = pkt[1];
+        info->checksum = read_u16_be(pkt + 2);
+        info->rest = read_u32_be(pkt + 4);
         return info;
     }
 };
@@ -505,6 +506,239 @@ public:
         auto it = parsers.find(static_cast<uint8_t>(proto));
         if (it == parsers.end()) return nullptr;
         return it->second->parse(pkt, len);
+    }
+};
+
+// ==================== L5 structures ====================
+
+// L5 protocol is inferred from well-known port numbers in the L4 header,
+// since there is no explicit protocol field above L4.
+enum class L5Proto : uint8_t {
+    HTTP = 1,
+    TLS = 2, // covers HTTPS and any other TLS-wrapped protocol
+    DNS = 3,
+    Unknown = 0xFF
+};
+
+// base class - holds the protocol tag
+struct L5Info {
+    L5Proto protocol;
+    size_t header_len = 0;
+
+    explicit L5Info(L5Proto p) : protocol(p) {}
+    virtual ~L5Info() = default;
+};
+
+/*
+HTTP/1.x — text framed protocol, no fixed binary header.
+We capture the method/status line and whether this looks like a request or response.
+
+Request first line:  METHOD SP request-target SP HTTP/version CRLF
+Response first line: HTTP/version SP status-code SP reason CRLF
+*/
+enum class HttpKind : uint8_t { Request, Response };
+
+struct HttpL5Info : L5Info {
+    HttpKind kind;
+    string method;      // e.g. GET, POST — only for requests
+    string target;      // request-target (URI) — only for requests
+    uint16_t status_code; // e.g. 200, 404 — only for responses
+    string version;     // e.g. HTTP/1.1
+
+    HttpL5Info() : L5Info(L5Proto::HTTP) {}
+};
+
+/*
+TLS record header:
+[content_type:1][version_major:1][version_minor:1][length:2]
+
+content_type values:
+  20 = ChangeCipherSpec
+  21 = Alert
+  22 = Handshake
+  23 = ApplicationData
+
+version field encodes the legacy record-layer version (not the negotiated TLS version).
+  0x0301 = TLS 1.0
+  0x0302 = TLS 1.1
+  0x0303 = TLS 1.2 / TLS 1.3 (TLS 1.3 reuses 0x0303 in the record layer)
+*/
+enum class TlsContentType : uint8_t {
+    ChangeCipherSpec = 20,
+    Alert = 21,
+    Handshake = 22,
+    ApplicationData = 23,
+    Unknown = 0xFF
+};
+
+static TlsContentType to_tls_content_type(uint8_t v) {
+    switch (v) {
+        case 20: return TlsContentType::ChangeCipherSpec;
+        case 21: return TlsContentType::Alert;
+        case 22: return TlsContentType::Handshake;
+        case 23: return TlsContentType::ApplicationData;
+        default: return TlsContentType::Unknown;
+    }
+}
+
+struct TlsL5Info : L5Info {
+    TlsContentType content_type;
+    uint8_t version_major;
+    uint8_t version_minor;
+    uint16_t record_len; // length of the TLS record payload (bytes after the 5-byte header)
+
+    TlsL5Info() : L5Info(L5Proto::TLS) {}
+};
+
+/*
+DNS header:
+[id:2][flags:2][qdcount:2][ancount:2][nscount:2][arcount:2]
+
+flags breakdown (high to low):
+  QR(1) OPCODE(4) AA(1) TC(1) RD(1) RA(1) Z(3) RCODE(4)
+*/
+struct DnsL5Info : L5Info {
+    uint16_t id;
+    bool is_response;         // QR bit
+    bool is_truncated;        // TC bit
+    bool recursion_desired;   // RD bit
+    bool recursion_available; // RA bit
+    uint8_t opcode;  // 4-bit opcode
+    uint8_t rcode;   // 4-bit response code
+    uint16_t qdcount; // number of questions
+    uint16_t ancount; // number of answers
+    uint16_t nscount; // number of authority records
+    uint16_t arcount; // number of additional records
+
+    DnsL5Info() : L5Info(L5Proto::DNS) {}
+};
+
+// base class for L5 parsers
+struct L5Parser {
+    virtual unique_ptr<L5Info> parse(const uint8_t* pkt, size_t len) const = 0;
+    virtual ~L5Parser() = default;
+};
+
+struct HttpL5Parser : L5Parser {
+    unique_ptr<L5Info> parse(const uint8_t* pkt, size_t len) const override {
+        if (len < 8) return nullptr;
+
+        // scan for the end of the first line (CRLF or just LF)
+        size_t line_end = len;
+        for (size_t i = 0; i + 1 < len; i++) {
+            if (pkt[i] == '\r' && pkt[i + 1] == '\n') { line_end = i; break; }
+            if (pkt[i] == '\n')                        { line_end = i; break; }
+        }
+
+        string first_line(reinterpret_cast<const char*>(pkt), line_end);
+
+        auto info = make_unique<HttpL5Info>();
+
+        // responses start with HTTP/
+        if (first_line.substr(0, 5) == "HTTP/") {
+            info->kind = HttpKind::Response;
+            // HTTP/x.y SP status SP reason
+            size_t sp1 = first_line.find(' ');
+            if (sp1 == string::npos) return nullptr;
+
+            info->version = first_line.substr(0, sp1);
+
+            size_t sp2 = first_line.find(' ', sp1 + 1);
+            string code_str = first_line.substr(sp1 + 1, sp2 - sp1 - 1);
+            info->status_code = static_cast<uint16_t>(stoi(code_str));
+        }
+        else {
+            info->kind = HttpKind::Request;
+            // METHOD SP target SP HTTP/x.y
+            size_t sp1 = first_line.find(' ');
+            if (sp1 == string::npos) return nullptr;
+
+            info->method = first_line.substr(0, sp1);
+
+            size_t sp2 = first_line.find(' ', sp1 + 1);
+            if (sp2 == string::npos) return nullptr;
+
+            info->target = first_line.substr(sp1 + 1, sp2 - sp1 - 1);
+            info->version = first_line.substr(sp2 + 1);
+        }
+
+        // header_len covers only the first line + line terminator
+        info->header_len = line_end + (line_end < len && pkt[line_end] == '\r' ? 2 : 1);
+        return info;
+    }
+};
+
+struct TlsL5Parser : L5Parser {
+    unique_ptr<L5Info> parse(const uint8_t* pkt, size_t len) const override {
+        // TLS record header is exactly 5 bytes
+        if (len < 5) return nullptr;
+
+        // sanity check: version major must be 3 (all SSL3/TLS versions use 3)
+        if (pkt[1] != 3) return nullptr;
+
+        TlsContentType ct = to_tls_content_type(pkt[0]);
+        if (ct == TlsContentType::Unknown) return nullptr;
+
+        auto info = make_unique<TlsL5Info>();
+        info->header_len = 5;
+        info->content_type = ct;
+        info->version_major = pkt[1];
+        info->version_minor = pkt[2];
+        info->record_len = read_u16_be(pkt + 3);
+        return info;
+    }
+};
+
+struct DnsL5Parser : L5Parser {
+    unique_ptr<L5Info> parse(const uint8_t* pkt, size_t len) const override {
+        // DNS header is exactly 12 bytes
+        if (len < 12) return nullptr;
+
+        auto info = make_unique<DnsL5Info>();
+        info->header_len = 12;
+
+        info->id = read_u16_be(pkt + 0);
+
+        uint16_t flags = read_u16_be(pkt + 2);
+        info->is_response = (flags >> 15) & 1;
+        info->opcode = (flags >> 11) & 0x0F;
+        info->is_truncated = (flags >> 9)  & 1;
+        info->recursion_desired = (flags >> 8)  & 1;
+        info->recursion_available = (flags >> 7)  & 1;
+        info->rcode = flags & 0x0F;
+
+        info->qdcount = read_u16_be(pkt + 4);
+        info->ancount = read_u16_be(pkt + 6);
+        info->nscount = read_u16_be(pkt + 8);
+        info->arcount = read_u16_be(pkt + 10);
+        return info;
+    }
+};
+
+// L5 registry keys on port number rather than a protocol enum,
+// since there is no explicit L5 protocol field on the wire.
+// We check both dst_port and src_port so replies are also matched.
+class L5ParserRegistry {
+    unordered_map<uint16_t, unique_ptr<L5Parser>> parsers;
+
+public:
+    L5ParserRegistry() {
+        parsers[80] = make_unique<HttpL5Parser>();
+        parsers[8080] = make_unique<HttpL5Parser>();
+        parsers[443] = make_unique<TlsL5Parser>();
+        parsers[8443] = make_unique<TlsL5Parser>();
+        parsers[53] = make_unique<DnsL5Parser>();
+    }
+
+    unique_ptr<L5Info> parse(uint16_t src_port, uint16_t dst_port, const uint8_t* pkt, size_t len) const {
+        for (uint16_t port : {dst_port, src_port}) {
+            auto it = parsers.find(port);
+            if (it != parsers.end()) {
+                auto result = it->second->parse(pkt, len);
+                if (result) return result;
+            }
+        }
+        return nullptr;
     }
 };
 
@@ -582,6 +816,7 @@ public:
     optional<L2Info>   l2; // populated after stripL2(), empty until then
     optional<L3Info>   l3; // populated after stripL3(), empty until then
     unique_ptr<L4Info> l4; // populated after stripL4(), null until then
+    unique_ptr<L5Info> l5; // populated after stripL5(), null until then
 
     Packet(const uint8_t* packet_ptr, size_t packet_size, double time, int packet_id) {
         data.assign(packet_ptr, packet_ptr + packet_size);
@@ -594,7 +829,6 @@ public:
         l2 = registry.parse(dlt, data.data(), data.size());
         if (!l2) return;
 
-        // erase exactly the header bytes from the front
         data.erase(data.begin(), data.begin() + l2->header_len);
     }
 
@@ -618,6 +852,35 @@ public:
         if (!l4) return;
 
         data.erase(data.begin(), data.begin() + l4->header_len);
+    }
+
+    // Parses the L5 header, stores metadata in l5, then erases those bytes from data so data begins at the application body.
+    // Must be called after stripL4() so that data starts at the session-layer payload.
+    // Only meaningful for TCP and UDP — ICMP has no session layer.
+    void stripL5(const L5ParserRegistry& registry) {
+        if (!l4) return;
+
+        uint16_t src_port = 0;
+        uint16_t dst_port = 0;
+
+        if (l4->protocol == IPProto::TCP) {
+            const auto& t = static_cast<const TcpL4Info&>(*l4);
+            src_port = t.src_port;
+            dst_port = t.dst_port;
+        }
+        else if (l4->protocol == IPProto::UDP) {
+            const auto& u = static_cast<const UdpL4Info&>(*l4);
+            src_port = u.src_port;
+            dst_port = u.dst_port;
+        }
+        else {
+            return; // ICMP/ICMPv6 have no L5
+        }
+
+        l5 = registry.parse(src_port, dst_port, data.data(), data.size());
+        if (!l5) return;
+
+        data.erase(data.begin(), data.begin() + l5->header_len);
     }
 };
 
@@ -667,11 +930,11 @@ static void print_ip(const optional<IPAddr>& ip, const char* label) {
 
 static const char* proto_name(IPProto p) {
     switch (p) {
-        case IPProto::ICMP: return "ICMP";
-        case IPProto::TCP: return "TCP";
-        case IPProto::UDP: return "UDP";
+        case IPProto::ICMP:   return "ICMP";
+        case IPProto::TCP:    return "TCP";
+        case IPProto::UDP:    return "UDP";
         case IPProto::ICMPv6: return "ICMPv6";
-        default: return "?";
+        default:              return "?";
     }
 }
 
@@ -690,12 +953,12 @@ static void print_l4(const unique_ptr<L4Info>& l4) {
                  << " seq=" << t.seq << " ack=" << t.ack
                  << " win=" << t.window
                  << " flags=[";
-            if (t.syn())  cout << "SYN ";
+            if (t.syn())   cout << "SYN ";
             if (t.ack_f()) cout << "ACK ";
-            if (t.fin())  cout << "FIN ";
-            if (t.rst())  cout << "RST ";
-            if (t.psh())  cout << "PSH ";
-            if (t.urg())  cout << "URG ";
+            if (t.fin())   cout << "FIN ";
+            if (t.rst())   cout << "RST ";
+            if (t.psh())   cout << "PSH ";
+            if (t.urg())   cout << "URG ";
             cout << "]";
             break;
         }
@@ -723,6 +986,54 @@ static void print_l4(const unique_ptr<L4Info>& l4) {
     }
 }
 
+static const char* tls_content_type_name(TlsContentType ct) {
+    switch (ct) {
+        case TlsContentType::ChangeCipherSpec: return "ChangeCipherSpec";
+        case TlsContentType::Alert:            return "Alert";
+        case TlsContentType::Handshake:        return "Handshake";
+        case TlsContentType::ApplicationData:  return "ApplicationData";
+        default:                               return "?";
+    }
+}
+
+static void print_l5(const unique_ptr<L5Info>& l5) {
+    if (!l5) {
+        cout << " | no L5";
+        return;
+    }
+
+    cout << " | ";
+
+    switch (l5->protocol) {
+        case L5Proto::HTTP: {
+            const auto& h = static_cast<const HttpL5Info&>(*l5);
+            if (h.kind == HttpKind::Request)
+                cout << "HTTP " << h.method << " " << h.target << " " << h.version;
+            else
+                cout << "HTTP " << h.version << " " << h.status_code;
+            break;
+        }
+        case L5Proto::TLS: {
+            const auto& t = static_cast<const TlsL5Info&>(*l5);
+            cout << "TLS " << tls_content_type_name(t.content_type)
+                 << " v" << static_cast<int>(t.version_major) << "." << static_cast<int>(t.version_minor)
+                 << " len=" << t.record_len;
+            break;
+        }
+        case L5Proto::DNS: {
+            const auto& d = static_cast<const DnsL5Info&>(*l5);
+            cout << "DNS id=" << d.id
+                 << (d.is_response ? " QR=response" : " QR=query")
+                 << " qd=" << d.qdcount
+                 << " an=" << d.ancount;
+            break;
+        }
+        default:
+            cout << "unknown L5";
+            break;
+    }
+}
+
 double now() {
     return chrono::duration<double>(
         chrono::system_clock::now().time_since_epoch()
@@ -736,6 +1047,7 @@ int main() {
     L2ParserRegistry l2_registry;
     L3ParserRegistry l3_registry;
     L4ParserRegistry l4_registry;
+    L5ParserRegistry l5_registry;
 
     const uint8_t* data;
     size_t size;
@@ -755,6 +1067,7 @@ int main() {
             pkt.stripL2(l2_registry, dlt);
             pkt.stripL3(l3_registry);
             pkt.stripL4(l4_registry);
+            pkt.stripL5(l5_registry);
 
             if (pkt.l2) {
                 cout << " | ";
@@ -779,6 +1092,7 @@ int main() {
             }
 
             print_l4(pkt.l4);
+            print_l5(pkt.l5);
 
             if (pkt.l4)
                 cout << " | payload: " << pkt.data.size() << " bytes";
