@@ -11,6 +11,7 @@
 #include <optional>
 #include <unordered_map>
 #include <string>
+#include <cstring>
 
 using namespace std;
 
@@ -347,6 +348,166 @@ public:
     }
 };
 
+// ==================== L4 structures ====================
+
+// base class - holds the protocol tag
+struct L4Info {
+    IPProto protocol;
+    size_t  header_len = 0;
+
+    explicit L4Info(IPProto p) : protocol(p) {}
+    virtual ~L4Info() = default;
+};
+
+/*
+TCP header:
+[src_port:2][dst_port:2][seq:4][ack:4]
+[data_offset+reserved+flags:2][window:2][checksum:2][urgent:2]
+[options: variable]
+*/
+struct TcpL4Info : L4Info {
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint32_t seq;
+    uint32_t ack;
+    uint16_t window;
+    uint8_t  flags; // CWR ECE URG ACK PSH RST SYN FIN (high to low bit)
+
+    // flag accessors
+    bool fin()  const { return flags & 0x01; }
+    bool syn()  const { return flags & 0x02; }
+    bool rst()  const { return flags & 0x04; }
+    bool psh()  const { return flags & 0x08; }
+    bool ack_f() const { return flags & 0x10; }
+    bool urg()  const { return flags & 0x20; }
+
+    TcpL4Info() : L4Info(IPProto::TCP) {}
+};
+
+/*
+UDP header:
+[src_port:2][dst_port:2][length:2][checksum:2]
+*/
+struct UdpL4Info : L4Info {
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint16_t length; // includes header + data
+
+    UdpL4Info() : L4Info(IPProto::UDP) {}
+};
+
+/*
+ICMP header (v4):
+[type:1][code:1][checksum:2][rest_of_header:4]
+rest_of_header interpretation depends on type/code (e.g. id+seq for echo, unused for dest unreachable)
+*/
+struct IcmpL4Info : L4Info {
+    uint8_t type;
+    uint8_t code;
+    uint16_t checksum;
+    uint32_t rest;
+
+    IcmpL4Info() : L4Info(IPProto::ICMP) {}
+};
+
+/*
+ICMPv6 header - same wire layout as ICMPv4
+[type:1][code:1][checksum:2][rest_of_header:4]
+*/
+struct ICMPv6L4Info : L4Info {
+    uint8_t type;
+    uint8_t code;
+    uint16_t checksum;
+    uint32_t rest;
+
+    ICMPv6L4Info() : L4Info(IPProto::ICMPv6) {}
+};
+
+// base class for L4 parsers - returns owning pointer to polymorphic L4Info
+struct L4Parser {
+    virtual unique_ptr<L4Info> parse(const uint8_t* pkt, size_t len) const = 0;
+    virtual ~L4Parser() = default;
+};
+
+struct TcpL4Parser : L4Parser {
+    unique_ptr<L4Info> parse(const uint8_t* pkt, size_t len) const override {
+        if (len < 20) return nullptr;
+
+        uint8_t data_offset = (pkt[12] >> 4); // upper nibble of byte 12
+        size_t  hdr = static_cast<size_t>(data_offset) * 4;
+        if (hdr < 20 || len < hdr) return nullptr;
+
+        auto info = make_unique<TcpL4Info>();
+        info->header_len = hdr;
+        info->src_port   = read_u16_be(pkt + 0);
+        info->dst_port   = read_u16_be(pkt + 2);
+        info->seq        = read_u32_be(pkt + 4);
+        info->ack        = read_u32_be(pkt + 8);
+        info->flags      = pkt[13];
+        info->window     = read_u16_be(pkt + 14);
+        return info;
+    }
+};
+
+struct UdpL4Parser : L4Parser {
+    unique_ptr<L4Info> parse(const uint8_t* pkt, size_t len) const override {
+        if (len < 8) return nullptr;
+
+        auto info = make_unique<UdpL4Info>();
+        info->header_len = 8;
+        info->src_port   = read_u16_be(pkt + 0);
+        info->dst_port   = read_u16_be(pkt + 2);
+        info->length     = read_u16_be(pkt + 4);
+        return info;
+    }
+};
+
+struct IcmpL4Parser : L4Parser {
+    unique_ptr<L4Info> parse(const uint8_t* pkt, size_t len) const override {
+        if (len < 8) return nullptr;
+
+        auto info = make_unique<IcmpL4Info>();
+        info->header_len = 8;
+        info->type       = pkt[0];
+        info->code       = pkt[1];
+        info->checksum   = read_u16_be(pkt + 2);
+        info->rest       = read_u32_be(pkt + 4);
+        return info;
+    }
+};
+
+struct ICMPv6L4Parser : L4Parser {
+    unique_ptr<L4Info> parse(const uint8_t* pkt, size_t len) const override {
+        if (len < 8) return nullptr;
+
+        auto info = make_unique<ICMPv6L4Info>();
+        info->header_len = 8;
+        info->type       = pkt[0];
+        info->code       = pkt[1];
+        info->checksum   = read_u16_be(pkt + 2);
+        info->rest       = read_u32_be(pkt + 4);
+        return info;
+    }
+};
+
+class L4ParserRegistry {
+    unordered_map<uint8_t, unique_ptr<L4Parser>> parsers;
+
+public:
+    L4ParserRegistry() {
+        parsers[static_cast<uint8_t>(IPProto::TCP)] = make_unique<TcpL4Parser>();
+        parsers[static_cast<uint8_t>(IPProto::UDP)] = make_unique<UdpL4Parser>();
+        parsers[static_cast<uint8_t>(IPProto::ICMP)] = make_unique<IcmpL4Parser>();
+        parsers[static_cast<uint8_t>(IPProto::ICMPv6)] = make_unique<ICMPv6L4Parser>();
+    }
+
+    unique_ptr<L4Info> parse(IPProto proto, const uint8_t* pkt, size_t len) const {
+        auto it = parsers.find(static_cast<uint8_t>(proto));
+        if (it == parsers.end()) return nullptr;
+        return it->second->parse(pkt, len);
+    }
+};
+
 // ==================== Packet Capture ====================
 
 class PacketSource {
@@ -418,8 +579,9 @@ public:
     vector<uint8_t> data;
     double time;
     int packet_id;
-    optional<L2Info> l2; // populated after stripL2(), empty until then
-    optional<L3Info> l3; // populated after stripL3(), empty until then
+    optional<L2Info>   l2; // populated after stripL2(), empty until then
+    optional<L3Info>   l3; // populated after stripL3(), empty until then
+    unique_ptr<L4Info> l4; // populated after stripL4(), null until then
 
     Packet(const uint8_t* packet_ptr, size_t packet_size, double time, int packet_id) {
         data.assign(packet_ptr, packet_ptr + packet_size);
@@ -445,6 +607,17 @@ public:
         if (!l3) return;
 
         data.erase(data.begin(), data.begin() + l3->header_len);
+    }
+
+    // Parses the L4 header, stores metadata in l4, then erases those bytes from data so data begins at the application payload.
+    // Must be called after stripL3() so that data starts at the transport header.
+    void stripL4(const L4ParserRegistry& registry) {
+        if (!l3) return;
+
+        l4 = registry.parse(l3->proto, data.data(), data.size());
+        if (!l4) return;
+
+        data.erase(data.begin(), data.begin() + l4->header_len);
     }
 };
 
@@ -502,6 +675,54 @@ static const char* proto_name(IPProto p) {
     }
 }
 
+static void print_l4(const unique_ptr<L4Info>& l4) {
+    if (!l4) {
+        cout << " | no L4";
+        return;
+    }
+
+    cout << " | ";
+
+    switch (l4->protocol) {
+        case IPProto::TCP: {
+            const auto& t = static_cast<const TcpL4Info&>(*l4);
+            cout << "TCP " << t.src_port << " -> " << t.dst_port
+                 << " seq=" << t.seq << " ack=" << t.ack
+                 << " win=" << t.window
+                 << " flags=[";
+            if (t.syn())  cout << "SYN ";
+            if (t.ack_f()) cout << "ACK ";
+            if (t.fin())  cout << "FIN ";
+            if (t.rst())  cout << "RST ";
+            if (t.psh())  cout << "PSH ";
+            if (t.urg())  cout << "URG ";
+            cout << "]";
+            break;
+        }
+        case IPProto::UDP: {
+            const auto& u = static_cast<const UdpL4Info&>(*l4);
+            cout << "UDP " << u.src_port << " -> " << u.dst_port
+                 << " len=" << u.length;
+            break;
+        }
+        case IPProto::ICMP: {
+            const auto& i = static_cast<const IcmpL4Info&>(*l4);
+            cout << "ICMP type=" << static_cast<int>(i.type)
+                 << " code=" << static_cast<int>(i.code);
+            break;
+        }
+        case IPProto::ICMPv6: {
+            const auto& i = static_cast<const ICMPv6L4Info&>(*l4);
+            cout << "ICMPv6 type=" << static_cast<int>(i.type)
+                 << " code=" << static_cast<int>(i.code);
+            break;
+        }
+        default:
+            cout << "unknown L4";
+            break;
+    }
+}
+
 double now() {
     return chrono::duration<double>(
         chrono::system_clock::now().time_since_epoch()
@@ -514,6 +735,7 @@ int main() {
     PacketSource pkt_src;
     L2ParserRegistry l2_registry;
     L3ParserRegistry l3_registry;
+    L4ParserRegistry l4_registry;
 
     const uint8_t* data;
     size_t size;
@@ -532,6 +754,7 @@ int main() {
             Packet pkt(data, size, now() - start, packet_id++);
             pkt.stripL2(l2_registry, dlt);
             pkt.stripL3(l3_registry);
+            pkt.stripL4(l4_registry);
 
             if (pkt.l2) {
                 cout << " | ";
@@ -549,14 +772,18 @@ int main() {
                 cout << "  ";
                 print_ip(pkt.l3->dst_ip, "dst");
                 cout << " | proto: " << proto_name(pkt.l3->proto)
-                     << " ttl: " << static_cast<int>(pkt.l3->ttl)
-                     << " | L4 payload: " << pkt.data.size() << " bytes";
+                     << " ttl: " << static_cast<int>(pkt.l3->ttl);
             } 
             else {
                 cout << " | no L3";
             }
 
-            packets.push_back(pkt);
+            print_l4(pkt.l4);
+
+            if (pkt.l4)
+                cout << " | payload: " << pkt.data.size() << " bytes";
+
+            packets.push_back(move(pkt));
             cout << endl;
         }
     }
