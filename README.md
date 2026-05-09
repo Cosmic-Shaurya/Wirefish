@@ -1,21 +1,39 @@
-# Wirefish
+# Packet Sniffer
 
-A simple C++ packet sniffer built using **libpcap**.  
-This project captures live network packets from a selected interface and stores them in memory for later analysis.
+A command-line tool that captures and decodes live network traffic across layers 2–5.
+The most important details in each layer are displayed.
 
-## Features
+## Dependencies
 
-- Lists available network interfaces and lets user select capture device
-- Captures live packets using libpcap
-- Stores packet data safely (deep copy)
-- Timestamping for each packet
+- `libpcap`
+- `g++` with C++17 support
 
-## Requirements
+## Build & Run
 
-- C++17 or later
-- libpcap installed
+**Linux (Ubuntu/Debian)**
+```bash
+sudo apt install libpcap-dev g++
+g++ -std=c++17 -o sniffer main.cpp -lpcap
+sudo ./sniffer
+```
 
-## Compilation
+**Linux (Fedora/RHEL)**
+```bash
+sudo dnf install libpcap-devel g++
+g++ -std=c++17 -o sniffer main.cpp -lpcap
+sudo ./sniffer
+```
 
-- Use g++ main.cpp -o main -I"[FOLDER]\Include" -L"[FOLDER]\Lib\x64" -lwpcap
-- [FOLDER] is the libpcap directory
+**macOS**
+```bash
+brew install libpcap
+g++ -std=c++17 -o sniffer main.cpp -lpcap
+sudo ./sniffer
+```
+
+**Windows (MSYS2/MinGW)**
+```bash
+pacman -S mingw-w64-x86_64-npcap-sdk mingw-w64-x86_64-gcc
+g++ -std=c++17 -o sniffer main.cpp -lwpcap
+./sniffer  # run as Administrator
+```

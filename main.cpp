@@ -928,6 +928,29 @@ static void print_ip(const optional<IPAddr>& ip, const char* label) {
     }
 }
 
+static const char* ether_proto_name(EtherProto p) {
+    switch (p) {
+        case EtherProto::IPv4: return "IPv4";
+        case EtherProto::IPv6: return "IPv6";
+        case EtherProto::ARP:  return "ARP";
+        case EtherProto::VLAN: return "VLAN";
+        default:               return "?";
+    }
+}
+
+static void print_l2(const optional<L2Info>& l2) {
+    if (!l2) {
+        cout << " | no L2";
+        return;
+    }
+
+    cout << " | ";
+    print_mac(l2->dst_mac, "dst");
+    cout << "  ";
+    print_mac(l2->src_mac, "src");
+    cout << " | ether=" << ether_proto_name(l2->proto);
+}
+
 static const char* proto_name(IPProto p) {
     switch (p) {
         case IPProto::ICMP:   return "ICMP";
@@ -936,6 +959,22 @@ static const char* proto_name(IPProto p) {
         case IPProto::ICMPv6: return "ICMPv6";
         default:              return "?";
     }
+}
+
+static void print_l3(const optional<L3Info>& l3) {
+    if (!l3) {
+        cout << " | no L3";
+        return;
+    }
+
+    cout << " | ";
+    print_ip(l3->src_ip, "src");
+    cout << "  ";
+    print_ip(l3->dst_ip, "dst");
+
+    cout << " | proto: " << proto_name(l3->proto)
+         << " ttl: " << static_cast<int>(l3->ttl)
+         << " total_len: " << l3->total_len;
 }
 
 static void print_l4(const unique_ptr<L4Info>& l4) {
@@ -1061,7 +1100,8 @@ int main() {
     cout << "================== CAPTURE SESSION STARTED ==================" << endl;
     while (true) {
         if (pkt_src.getPacket(data, size)) {
-            cout << "Packet (" << size << " bytes) received at " << now() - start << " seconds";
+            cout << "Packet (" << size << " bytes) received at "
+                << now() - start << " seconds";
 
             Packet pkt(data, size, now() - start, packet_id++);
             pkt.stripL2(l2_registry, dlt);
@@ -1069,28 +1109,12 @@ int main() {
             pkt.stripL4(l4_registry);
             pkt.stripL5(l5_registry);
 
-            if (pkt.l2) {
-                cout << " | ";
-                print_mac(pkt.l2->dst_mac, "dst");
-                cout << "  ";
-                print_mac(pkt.l2->src_mac, "src");
-            } 
-            else {
+            if (!pkt.l2)
                 cout << " | unknown link type " << dlt;
-            }
+            else
+                print_l2(pkt.l2);
 
-            if (pkt.l3) {
-                cout << " | ";
-                print_ip(pkt.l3->src_ip, "src");
-                cout << "  ";
-                print_ip(pkt.l3->dst_ip, "dst");
-                cout << " | proto: " << proto_name(pkt.l3->proto)
-                     << " ttl: " << static_cast<int>(pkt.l3->ttl);
-            } 
-            else {
-                cout << " | no L3";
-            }
-
+            print_l3(pkt.l3);
             print_l4(pkt.l4);
             print_l5(pkt.l5);
 
