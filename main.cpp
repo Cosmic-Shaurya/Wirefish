@@ -284,11 +284,11 @@ struct IPv6L3Parser : L3Parser {
         while (true) {
             // check if it's an extension header
             bool is_ext = (
-                next == 0  || // Hop-by-Hop
+                next == 0  || // hop by hop
                 next == 43 || // Routing
                 next == 44 || // Fragment
                 next == 51 || // AH
-                next == 60    // Destination Options
+                next == 60 // destination Options
             );
 
             if (!is_ext) break; // then it must be L4 header
@@ -511,8 +511,7 @@ public:
 
 // ==================== L5 structures ====================
 
-// L5 protocol is inferred from well-known port numbers in the L4 header,
-// since there is no explicit protocol field above L4.
+// L5 protocol is inferred from well-known port numbers in the L4 header, since there is no explicit protocol field above L4.
 enum class L5Proto : uint8_t {
     HTTP = 1,
     TLS = 2, // covers HTTPS and any other TLS-wrapped protocol
@@ -530,11 +529,8 @@ struct L5Info {
 };
 
 /*
-HTTP/1.x — text framed protocol, no fixed binary header.
-We capture the method/status line and whether this looks like a request or response.
-
-Request first line:  METHOD SP request-target SP HTTP/version CRLF
-Response first line: HTTP/version SP status-code SP reason CRLF
+HTTP/1.x — text framed protocol, no fixed binary header
+we capture the method/status line and whether this looks like a request or response
 */
 enum class HttpKind : uint8_t { Request, Response };
 
@@ -558,7 +554,6 @@ content_type values:
   22 = Handshake
   23 = ApplicationData
 
-version field encodes the legacy record-layer version (not the negotiated TLS version).
   0x0301 = TLS 1.0
   0x0302 = TLS 1.1
   0x0303 = TLS 1.2 / TLS 1.3 (TLS 1.3 reuses 0x0303 in the record layer)
