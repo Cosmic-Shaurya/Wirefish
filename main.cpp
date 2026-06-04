@@ -12,22 +12,20 @@
 #include <unordered_map>
 #include <string>
 #include <cstring>
+#include <fstream>
 
 using namespace std;
 
 // ==================== Byte utilities ====================
 
-// take two bytes and return a 16-bit number (big endian)
 inline uint16_t read_u16_be(const uint8_t* p) { 
     return (uint16_t(p[0]) << 8) | uint16_t(p[1]);
 }
 
-// take four bytes and return a 32-bit number (big endian)
 inline uint32_t read_u32_be(const uint8_t* p) { 
     return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
 }
 
-// four bytes -> 32 bit number but in host-byte order
 inline uint32_t read_u32_host(const uint8_t* p) { 
     uint32_t v;
     memcpy(&v, p, 4);
@@ -38,7 +36,6 @@ inline uint32_t read_u32_host(const uint8_t* p) {
 
 using MacAddr = array<uint8_t, 6>;
 
-// values that appear in ether type field
 enum class EtherProto : uint16_t {
     IPv4 = 0x0800,
     ARP = 0x0806,
@@ -47,7 +44,6 @@ enum class EtherProto : uint16_t {
     Unknown = 0xFFFF
 };
 
-// convert 16-bit number to EtherProto
 static EtherProto to_ether_proto(uint16_t v) {
     switch (v) {
         case 0x0800: return EtherProto::IPv4;
@@ -65,20 +61,16 @@ struct L2Info {
     size_t header_len;
 };
 
-// base class for different data link layer protocols
 struct L2Parser { 
     virtual optional<L2Info> parse(const uint8_t* pkt, size_t len) const = 0;
     virtual ~L2Parser() = default;
 
 protected:
-    static MacAddr read_mac(const uint8_t* p) { // take six bytes and return a MAC address
+    static MacAddr read_mac(const uint8_t* p) {
         return {p[0], p[1], p[2], p[3], p[4], p[5]};
     }
 };
 
-// note that things like preamble, sfd and fcs are stripped off by the packet capturer
-
-// format for Ethernet: [dst:6][src:6][etype:2][data]
 struct EthernetParser : L2Parser {
     optional<L2Info> parse(const uint8_t* pkt, size_t len) const override {
         if (len < 14) return nullopt;
@@ -90,27 +82,18 @@ struct EthernetParser : L2Parser {
         uint16_t etype = read_u16_be(pkt + 12);
         if (etype == static_cast<uint16_t>(EtherProto::VLAN)) {
             if (len < 18) return nullopt;
-            etype = read_u16_be(pkt + 16); // format for VLAN is a bit different: [dst:6][src:6][0x8100:2][tag:4][etype:2][data]
+            etype = read_u16_be(pkt + 16);
             info.header_len = 18;
         }
         else {
             info.header_len = 14;
         }
 
-        /* 
-        IEEE 802.3 Ethernet standard:
-        if type value is large ( >= 0x0600) then it is an Ethernet II frame. etype represents EtherType (IPv4, ARP, etc.)
-        otherwise, it is an IEEE 802.3 frame. etype represents the length of the payload.
-        */
-
         info.proto = (etype >= 0x0600) ? to_ether_proto(etype) : EtherProto::Unknown;
-        
         return info;
     }
 };
 
-// this is only for Linux
-// format for LinuxCooked: [pkt_type:2][arp_hw_type:2][addr_len:2][addr:8][proto:2]
 struct LinuxCookedParser : L2Parser {
     optional<L2Info> parse(const uint8_t* pkt, size_t len) const override {
         if (len < 16) return nullopt;
@@ -127,7 +110,6 @@ struct LinuxCookedParser : L2Parser {
     }
 };
 
-// format for loopback: [af_family:4]
 struct LoopbackParser : L2Parser {
     optional<L2Info> parse(const uint8_t* pkt, size_t len) const override {
         if (len < 4) return nullopt;
@@ -144,7 +126,6 @@ struct LoopbackParser : L2Parser {
     }
 };
 
-// no L2 header at all
 struct RawIPParser : L2Parser {
     optional<L2Info> parse(const uint8_t* pkt, size_t len) const override {
         if (len < 1) return nullopt;
@@ -187,7 +168,6 @@ public:
 using IPv4Addr = array<uint8_t, 4>;
 using IPv6Addr = array<uint8_t, 16>;
 
-// IP protocol numbers (the [protocol] field in IPv4, [next header] for IPv6)
 enum class IPProto : uint8_t {
     ICMP = 1,
     TCP = 6,
@@ -196,7 +176,6 @@ enum class IPProto : uint8_t {
     Unknown = 0xFF
 };
 
-// convert protocol number to IPProto
 static IPProto to_ip_proto(uint8_t v) {
     switch (v) {
         case 1:  return IPProto::ICMP;
@@ -207,7 +186,6 @@ static IPProto to_ip_proto(uint8_t v) {
     }
 }
 
-// holds either an IPv4 or IPv6 address
 struct IPAddr {
     bool is_v6 = false;
     IPv4Addr v4 {};
@@ -224,35 +202,32 @@ struct IPAddr {
         memcpy(a.v6.data(), p, 16);
         return a;
     }
+
+    bool operator==(const IPAddr& o) const {
+        if (is_v6 != o.is_v6) return false;
+        return is_v6 ? v6 == o.v6 : v4 == o.v4;
+    }
 };
 
 struct L3Info {
     optional<IPAddr> src_ip;
     optional<IPAddr> dst_ip;
     IPProto proto;
-    uint8_t ttl; // called hop limit for ipv6
-    uint16_t total_len; // datagram length in bytes
+    uint8_t ttl;
+    uint16_t total_len;
     size_t header_len;
 };
 
-// base class for network-layer parsers
 struct L3Parser {
     virtual optional<L3Info> parse(const uint8_t* pkt, size_t len) const = 0;
     virtual ~L3Parser() = default;
 };
 
-/*
-IPv4 header:
-[ver+hdr_len:1][service_type:1][total_len:2][id:2][flags+frag:2] (flags -> 3 bits, frag -> 13 bits)
-[ttl:1][protocol:1][checksum:2][src:4][dst:4]
-[header options: variable number of 32 bit words]
-[data]
-*/
 struct IPv4L3Parser : L3Parser {
     optional<L3Info> parse(const uint8_t* pkt, size_t len) const override {
         if (len < 20) return nullopt;
 
-        uint8_t hdr_len = (pkt[0] & 0x0F); // lower nibble of first byte
+        uint8_t hdr_len = (pkt[0] & 0x0F);
         size_t hdr = static_cast<size_t>(hdr_len) * 4;
         if (hdr < 20 || len < hdr) return nullopt;
 
@@ -267,41 +242,35 @@ struct IPv4L3Parser : L3Parser {
     }
 };
 
-/*
-IPv6 header:
-[ver+tc+flow:4][payload_len:2][next_header:1][hop_limit:1][src:16][dst:16]
-*/
 struct IPv6L3Parser : L3Parser {
-
     optional<L3Info> parse(const uint8_t* pkt, size_t len) const override {
         if (len < 40) return nullopt;
 
         L3Info info;
 
-        uint8_t next = pkt[6]; // next header
-        size_t offset = 40; // how much to jump to reach actual L4 header
+        uint8_t next = pkt[6];
+        size_t offset = 40;
 
         while (true) {
-            // check if it's an extension header
             bool is_ext = (
-                next == 0  || // hop by hop
-                next == 43 || // Routing
-                next == 44 || // Fragment
-                next == 51 || // AH
-                next == 60 // destination Options
+                next == 0  ||
+                next == 43 ||
+                next == 44 ||
+                next == 51 ||
+                next == 60
             );
 
-            if (!is_ext) break; // then it must be L4 header
+            if (!is_ext) break;
 
             if (offset + 2 > len) return nullopt;
 
             uint8_t hdr_next = pkt[offset];
             size_t ext_size = 0;
 
-            if (next == 44) { // Fragment
+            if (next == 44) {
                 ext_size = 8;
             } 
-            else if (next == 51) { // AH
+            else if (next == 51) {
                 uint8_t payload_len = pkt[offset + 1];
                 ext_size = (payload_len + 2) * 4;
             } 
@@ -316,7 +285,7 @@ struct IPv6L3Parser : L3Parser {
             next = hdr_next;
         }
 
-        if (next == 50) { // Encapsulating Security Payload
+        if (next == 50) {
             info.proto = IPProto::Unknown;
         }
         else {
@@ -351,7 +320,6 @@ public:
 
 // ==================== L4 structures ====================
 
-// base class - holds the protocol tag
 struct L4Info {
     IPProto protocol;
     size_t header_len = 0;
@@ -360,21 +328,14 @@ struct L4Info {
     virtual ~L4Info() = default;
 };
 
-/*
-TCP header:
-[src_port:2][dst_port:2][seq:4][ack:4]
-[data_offset+reserved+flags:2][window:2][checksum:2][urgent:2]
-[options: variable]
-*/
 struct TcpL4Info : L4Info {
     uint16_t src_port;
     uint16_t dst_port;
     uint32_t seq;
     uint32_t ack;
     uint16_t window;
-    uint8_t flags; // CWR ECE URG ACK PSH RST SYN FIN (high to low bit)
+    uint8_t flags;
 
-    // flag accessors
     bool fin()   const { return flags & 0x01; }
     bool syn()   const { return flags & 0x02; }
     bool rst()   const { return flags & 0x04; }
@@ -385,23 +346,14 @@ struct TcpL4Info : L4Info {
     TcpL4Info() : L4Info(IPProto::TCP) {}
 };
 
-/*
-UDP header:
-[src_port:2][dst_port:2][length:2][checksum:2]
-*/
 struct UdpL4Info : L4Info {
     uint16_t src_port;
     uint16_t dst_port;
-    uint16_t length; // includes header + data
+    uint16_t length;
 
     UdpL4Info() : L4Info(IPProto::UDP) {}
 };
 
-/*
-ICMP header (v4):
-[type:1][code:1][checksum:2][rest_of_header:4]
-rest_of_header interpretation depends on type/code (e.g. id+seq for echo, unused for dest unreachable)
-*/
 struct IcmpL4Info : L4Info {
     uint8_t type;
     uint8_t code;
@@ -411,10 +363,6 @@ struct IcmpL4Info : L4Info {
     IcmpL4Info() : L4Info(IPProto::ICMP) {}
 };
 
-/*
-ICMPv6 header - same wire layout as ICMPv4
-[type:1][code:1][checksum:2][rest_of_header:4]
-*/
 struct ICMPv6L4Info : L4Info {
     uint8_t type;
     uint8_t code;
@@ -424,7 +372,6 @@ struct ICMPv6L4Info : L4Info {
     ICMPv6L4Info() : L4Info(IPProto::ICMPv6) {}
 };
 
-// base class for L4 parsers - returns owning pointer to polymorphic L4Info
 struct L4Parser {
     virtual unique_ptr<L4Info> parse(const uint8_t* pkt, size_t len) const = 0;
     virtual ~L4Parser() = default;
@@ -434,7 +381,7 @@ struct TcpL4Parser : L4Parser {
     unique_ptr<L4Info> parse(const uint8_t* pkt, size_t len) const override {
         if (len < 20) return nullptr;
 
-        uint8_t data_offset = (pkt[12] >> 4); // upper nibble of byte 12
+        uint8_t data_offset = (pkt[12] >> 4);
         size_t hdr = static_cast<size_t>(data_offset) * 4;
         if (hdr < 20 || len < hdr) return nullptr;
 
@@ -511,15 +458,13 @@ public:
 
 // ==================== L5 structures ====================
 
-// L5 protocol is inferred from well-known port numbers in the L4 header, since there is no explicit protocol field above L4.
 enum class L5Proto : uint8_t {
     HTTP = 1,
-    TLS = 2, // covers HTTPS and any other TLS-wrapped protocol
+    TLS = 2,
     DNS = 3,
     Unknown = 0xFF
 };
 
-// base class - holds the protocol tag
 struct L5Info {
     L5Proto protocol;
     size_t header_len = 0;
@@ -528,36 +473,18 @@ struct L5Info {
     virtual ~L5Info() = default;
 };
 
-/*
-HTTP/1.x — text framed protocol, no fixed binary header
-we capture the method/status line and whether this looks like a request or response
-*/
 enum class HttpKind : uint8_t { Request, Response };
 
 struct HttpL5Info : L5Info {
     HttpKind kind;
-    string method;      // e.g. GET, POST — only for requests
-    string target;      // request-target (URI) — only for requests
-    uint16_t status_code; // e.g. 200, 404 — only for responses
-    string version;     // e.g. HTTP/1.1
+    string method;
+    string target;
+    uint16_t status_code;
+    string version;
 
     HttpL5Info() : L5Info(L5Proto::HTTP) {}
 };
 
-/*
-TLS record header:
-[content_type:1][version_major:1][version_minor:1][length:2]
-
-content_type values:
-  20 = ChangeCipherSpec
-  21 = Alert
-  22 = Handshake
-  23 = ApplicationData
-
-  0x0301 = TLS 1.0
-  0x0302 = TLS 1.1
-  0x0303 = TLS 1.2 / TLS 1.3 (TLS 1.3 reuses 0x0303 in the record layer)
-*/
 enum class TlsContentType : uint8_t {
     ChangeCipherSpec = 20,
     Alert = 21,
@@ -580,35 +507,28 @@ struct TlsL5Info : L5Info {
     TlsContentType content_type;
     uint8_t version_major;
     uint8_t version_minor;
-    uint16_t record_len; // length of the TLS record payload (bytes after the 5-byte header)
+    uint16_t record_len;
+    string sni; // populated for ClientHello only
 
     TlsL5Info() : L5Info(L5Proto::TLS) {}
 };
 
-/*
-DNS header:
-[id:2][flags:2][qdcount:2][ancount:2][nscount:2][arcount:2]
-
-flags breakdown (high to low):
-  QR(1) OPCODE(4) AA(1) TC(1) RD(1) RA(1) Z(3) RCODE(4)
-*/
 struct DnsL5Info : L5Info {
     uint16_t id;
-    bool is_response;         // QR bit
-    bool is_truncated;        // TC bit
-    bool recursion_desired;   // RD bit
-    bool recursion_available; // RA bit
-    uint8_t opcode;  // 4-bit opcode
-    uint8_t rcode;   // 4-bit response code
-    uint16_t qdcount; // number of questions
-    uint16_t ancount; // number of answers
-    uint16_t nscount; // number of authority records
-    uint16_t arcount; // number of additional records
+    bool is_response;
+    bool is_truncated;
+    bool recursion_desired;
+    bool recursion_available;
+    uint8_t opcode;
+    uint8_t rcode;
+    uint16_t qdcount;
+    uint16_t ancount;
+    uint16_t nscount;
+    uint16_t arcount;
 
     DnsL5Info() : L5Info(L5Proto::DNS) {}
 };
 
-// base class for L5 parsers
 struct L5Parser {
     virtual unique_ptr<L5Info> parse(const uint8_t* pkt, size_t len) const = 0;
     virtual ~L5Parser() = default;
@@ -618,7 +538,6 @@ struct HttpL5Parser : L5Parser {
     unique_ptr<L5Info> parse(const uint8_t* pkt, size_t len) const override {
         if (len < 8) return nullptr;
 
-        // scan for the end of the first line (CRLF or just LF)
         size_t line_end = len;
         for (size_t i = 0; i + 1 < len; i++) {
             if (pkt[i] == '\r' && pkt[i + 1] == '\n') { line_end = i; break; }
@@ -629,10 +548,8 @@ struct HttpL5Parser : L5Parser {
 
         auto info = make_unique<HttpL5Info>();
 
-        // responses start with HTTP/
         if (first_line.substr(0, 5) == "HTTP/") {
             info->kind = HttpKind::Response;
-            // HTTP/x.y SP status SP reason
             size_t sp1 = first_line.find(' ');
             if (sp1 == string::npos) return nullptr;
 
@@ -644,7 +561,6 @@ struct HttpL5Parser : L5Parser {
         }
         else {
             info->kind = HttpKind::Request;
-            // METHOD SP target SP HTTP/x.y
             size_t sp1 = first_line.find(' ');
             if (sp1 == string::npos) return nullptr;
 
@@ -657,18 +573,71 @@ struct HttpL5Parser : L5Parser {
             info->version = first_line.substr(sp2 + 1);
         }
 
-        // header_len covers only the first line + line terminator
         info->header_len = line_end + (line_end < len && pkt[line_end] == '\r' ? 2 : 1);
         return info;
     }
 };
 
+// Walks a TLS ClientHello to extract the SNI hostname from the server_name extension.
+// Returns empty string if not found or if the record is not a ClientHello.
+static string extract_sni(const uint8_t* pkt, size_t len) {
+    // need record header(5) + handshake header(4) + client_hello fixed fields
+    if (len < 5 + 4 + 2 + 32 + 1) return {};
+
+    // must be Handshake record
+    if (pkt[0] != 22) return {};
+    // handshake type 1 = ClientHello
+    if (pkt[5] != 1) return {};
+
+    size_t off = 5 + 4; // skip record header and handshake header
+
+    off += 2; // client_version
+    off += 32; // random
+
+    if (off >= len) return {};
+    uint8_t sid_len = pkt[off++];
+    off += sid_len; // session_id
+
+    if (off + 2 > len) return {};
+    uint16_t cipher_len = read_u16_be(pkt + off);
+    off += 2 + cipher_len;
+
+    if (off + 1 > len) return {};
+    uint8_t comp_len = pkt[off++];
+    off += comp_len;
+
+    if (off + 2 > len) return {}; // no extensions
+    uint16_t ext_total = read_u16_be(pkt + off);
+    off += 2;
+
+    size_t ext_end = off + ext_total;
+    if (ext_end > len) return {};
+
+    while (off + 4 <= ext_end) {
+        uint16_t ext_type = read_u16_be(pkt + off);
+        uint16_t ext_len  = read_u16_be(pkt + off + 2);
+        off += 4;
+
+        if (ext_type == 0) { // server_name extension
+            // server_name_list_length(2) + name_type(1) + name_length(2) + name
+            if (off + 5 > ext_end) break;
+            off += 2; // list length
+            off += 1; // name_type (0 = host_name)
+            uint16_t name_len = read_u16_be(pkt + off);
+            off += 2;
+            if (off + name_len > ext_end) break;
+            return string(reinterpret_cast<const char*>(pkt + off), name_len);
+        }
+
+        off += ext_len;
+    }
+
+    return {};
+}
+
 struct TlsL5Parser : L5Parser {
     unique_ptr<L5Info> parse(const uint8_t* pkt, size_t len) const override {
-        // TLS record header is exactly 5 bytes
         if (len < 5) return nullptr;
-
-        // sanity check: version major must be 3 (all SSL3/TLS versions use 3)
         if (pkt[1] != 3) return nullptr;
 
         TlsContentType ct = to_tls_content_type(pkt[0]);
@@ -680,13 +649,16 @@ struct TlsL5Parser : L5Parser {
         info->version_major = pkt[1];
         info->version_minor = pkt[2];
         info->record_len = read_u16_be(pkt + 3);
+
+        if (ct == TlsContentType::Handshake)
+            info->sni = extract_sni(pkt, len);
+
         return info;
     }
 };
 
 struct DnsL5Parser : L5Parser {
     unique_ptr<L5Info> parse(const uint8_t* pkt, size_t len) const override {
-        // DNS header is exactly 12 bytes
         if (len < 12) return nullptr;
 
         auto info = make_unique<DnsL5Info>();
@@ -710,9 +682,6 @@ struct DnsL5Parser : L5Parser {
     }
 };
 
-// L5 registry keys on port number rather than a protocol enum,
-// since there is no explicit L5 protocol field on the wire.
-// We check both dst_port and src_port so replies are also matched.
 class L5ParserRegistry {
     unordered_map<uint16_t, unique_ptr<L5Parser>> parsers;
 
@@ -735,6 +704,153 @@ public:
         }
         return nullptr;
     }
+};
+
+// ==================== RTT Tracker ====================
+
+// Key identifying one direction of a TCP flow (src -> dst)
+struct FlowKey {
+    IPAddr src_ip, dst_ip;
+    uint16_t src_port, dst_port;
+
+    bool operator==(const FlowKey& o) const {
+        return src_ip == o.src_ip && dst_ip == o.dst_ip &&
+               src_port == o.src_port && dst_port == o.dst_port;
+    }
+};
+
+struct FlowKeyHash {
+    size_t operator()(const FlowKey& k) const {
+        size_t h = 0;
+        auto mix = [&](size_t v) { h ^= v + 0x9e3779b9 + (h << 6) + (h >> 2); }; // hash function obtained externally
+
+        if (!k.src_ip.is_v6) {
+            uint32_t v; memcpy(&v, k.src_ip.v4.data(), 4); mix(v);
+            memcpy(&v, k.dst_ip.v4.data(), 4); mix(v);
+        } 
+        else {
+            for (int i = 0; i < 4; i++) {
+                uint32_t v; memcpy(&v, k.src_ip.v6.data() + i*4, 4); mix(v);
+                memcpy(&v, k.dst_ip.v6.data() + i*4, 4); mix(v);
+            }
+        }
+        mix(k.src_port);
+        mix(k.dst_port);
+        return h;
+    }
+};
+
+// pending seq entry
+struct SeqEntry {
+    uint32_t seq;
+    double sent_time;
+};
+
+class RttTracker {
+    // maps forward flow -> list of unacked seq numbers + send times
+    unordered_map<FlowKey, vector<SeqEntry>, FlowKeyHash> pending;
+
+    // smoothed RTT per flow
+    unordered_map<FlowKey, double, FlowKeyHash> srtt;
+
+public:
+    // called when we see a TCP segment going forward
+    void record_seq(const FlowKey& fwd, uint32_t seq, double t) {
+        pending[fwd].push_back({seq, t});
+        // cap backlog
+        if (pending[fwd].size() > 256)
+            pending[fwd].erase(pending[fwd].begin());
+    }
+
+    // called when we see an ACK on the reverse flow; returns RTT sample or -1
+    double record_ack(const FlowKey& rev, uint32_t ack_num, double t) {
+        FlowKey fwd{rev.dst_ip, rev.src_ip, rev.dst_port, rev.src_port};
+
+        auto pit = pending.find(fwd);
+        if (pit == pending.end()) return -1.0;
+
+        double sample = -1.0;
+        auto& entries = pit->second;
+
+        for (auto it = entries.begin(); it != entries.end(); ) {
+            // ACK covers anything with seq < ack_num (wrap-safe within 2^31)
+            int32_t diff = static_cast<int32_t>(ack_num - it->seq);
+            if (diff > 0) {
+                double rtt = t - it->sent_time;
+                if (rtt > 0) sample = rtt;
+                it = entries.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        if (sample > 0) {
+            auto sit = srtt.find(fwd);
+            if (sit == srtt.end())
+                srtt[fwd] = sample;
+            else
+                sit->second = 0.875 * sit->second + 0.125 * sample; // EWMA
+        }
+
+        return sample;
+    }
+
+    optional<double> get_srtt(const FlowKey& fwd) const {
+        auto it = srtt.find(fwd);
+        if (it == srtt.end()) return nullopt;
+        return it->second;
+    }
+};
+
+// ==================== PCAP Writer ====================
+
+// writes a valid libpcap file that Wireshark can open
+class PcapWriter {
+    ofstream file;
+    bool ok = false;
+
+    void write_u16_le(uint16_t v) {
+        file.put(static_cast<char>(v & 0xFF));
+        file.put(static_cast<char>((v >> 8) & 0xFF));
+    }
+    void write_u32_le(uint32_t v) {
+        file.put(static_cast<char>(v & 0xFF));
+        file.put(static_cast<char>((v >> 8) & 0xFF));
+        file.put(static_cast<char>((v >> 16) & 0xFF));
+        file.put(static_cast<char>((v >> 24) & 0xFF));
+    }
+
+public:
+    PcapWriter(const string& path, int dlt) {
+        file.open(path, ios::binary);
+        if (!file.is_open()) return;
+
+        // global header
+        write_u32_le(0xa1b2c3d4); // magic
+        write_u16_le(2);// major version
+        write_u16_le(4); // minor version
+        write_u32_le(0); // timzone offset
+        write_u32_le(0);  // timestamp accuracy
+        write_u32_le(65535); // snap length
+        write_u32_le(static_cast<uint32_t>(dlt));
+        ok = true;
+    }
+
+    void write_packet(const vector<uint8_t>& raw, double timestamp) {
+        if (!ok) return;
+
+        uint32_t ts_sec  = static_cast<uint32_t>(timestamp);
+        uint32_t ts_usec = static_cast<uint32_t>((timestamp - ts_sec) * 1e6);
+        uint32_t cap_len = static_cast<uint32_t>(raw.size());
+
+        write_u32_le(ts_sec);
+        write_u32_le(ts_usec);
+        write_u32_le(cap_len); // captured length
+        write_u32_le(cap_len); // original length
+        file.write(reinterpret_cast<const char*>(raw.data()), cap_len);
+    }
+
+    bool is_ok() const { return ok; }
 };
 
 // ==================== Packet Capture ====================
@@ -806,75 +922,58 @@ public:
 class Packet {
 public:
     vector<uint8_t> data;
+    vector<uint8_t> raw; // original bytes for PCAP export
     double time;
     int packet_id;
-    optional<L2Info>   l2; // populated after stripL2(), empty until then
-    optional<L3Info>   l3; // populated after stripL3(), empty until then
-    unique_ptr<L4Info> l4; // populated after stripL4(), null until then
-    unique_ptr<L5Info> l5; // populated after stripL5(), null until then
+    optional<L2Info>   l2;
+    optional<L3Info>   l3;
+    unique_ptr<L4Info> l4;
+    unique_ptr<L5Info> l5;
 
     Packet(const uint8_t* packet_ptr, size_t packet_size, double time, int packet_id) {
         data.assign(packet_ptr, packet_ptr + packet_size);
+        raw = data; // save before stripping
         this->time = time;
         this->packet_id = packet_id;
     }
 
-    // Parses the L2 header, stores metadata in l2, then erases those bytes from data so data begins at the L3 payload.
     void stripL2(const L2ParserRegistry& registry, int dlt) {
         l2 = registry.parse(dlt, data.data(), data.size());
         if (!l2) return;
-
         data.erase(data.begin(), data.begin() + l2->header_len);
     }
 
-    // Parses the L3 header, stores metadata in l3, then erases those bytes from data so data begins at the L4 payload.
-    // Must be called after stripL2() so that data starts at the IP header.
     void stripL3(const L3ParserRegistry& registry) {
         if (!l2) return;
-
         l3 = registry.parse(l2->proto, data.data(), data.size());
         if (!l3) return;
-
         data.erase(data.begin(), data.begin() + l3->header_len);
     }
 
-    // Parses the L4 header, stores metadata in l4, then erases those bytes from data so data begins at the application payload.
-    // Must be called after stripL3() so that data starts at the transport header.
     void stripL4(const L4ParserRegistry& registry) {
         if (!l3) return;
-
         l4 = registry.parse(l3->proto, data.data(), data.size());
         if (!l4) return;
-
         data.erase(data.begin(), data.begin() + l4->header_len);
     }
 
-    // Parses the L5 header, stores metadata in l5, then erases those bytes from data so data begins at the application body.
-    // Must be called after stripL4() so that data starts at the session-layer payload.
-    // Only meaningful for TCP and UDP — ICMP has no session layer.
     void stripL5(const L5ParserRegistry& registry) {
         if (!l4) return;
 
-        uint16_t src_port = 0;
-        uint16_t dst_port = 0;
+        uint16_t src_port = 0, dst_port = 0;
 
         if (l4->protocol == IPProto::TCP) {
             const auto& t = static_cast<const TcpL4Info&>(*l4);
-            src_port = t.src_port;
-            dst_port = t.dst_port;
+            src_port = t.src_port; dst_port = t.dst_port;
         }
         else if (l4->protocol == IPProto::UDP) {
             const auto& u = static_cast<const UdpL4Info&>(*l4);
-            src_port = u.src_port;
-            dst_port = u.dst_port;
+            src_port = u.src_port; dst_port = u.dst_port;
         }
-        else {
-            return; // ICMP/ICMPv6 have no L5
-        }
+        else return;
 
         l5 = registry.parse(src_port, dst_port, data.data(), data.size());
         if (!l5) return;
-
         data.erase(data.begin(), data.begin() + l5->header_len);
     }
 };
@@ -883,13 +982,9 @@ public:
 
 static void print_mac(const optional<MacAddr>& mac, const char* label) {
     cout << label << ": ";
-    if (!mac) {
-        cout << "N/A";
-        return;
-    }
+    if (!mac) { cout << "N/A"; return; }
 
-    const char hex[16] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
-
+    const char hex[16] = {'0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f'};
     const MacAddr& m = *mac;
     for (int i = 0; i < 6; i++) {
         if (i) cout << ':';
@@ -899,22 +994,17 @@ static void print_mac(const optional<MacAddr>& mac, const char* label) {
 
 static void print_ip(const optional<IPAddr>& ip, const char* label) {
     cout << label << ": ";
-    if (!ip) {
-        cout << "N/A";
-        return;
-    }
+    if (!ip) { cout << "N/A"; return; }
 
-    const char hex[16] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+    const char hex[16] = {'0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f'};
 
     if (!ip->is_v6) {
-        // dotted-decimal
         for (int i = 0; i < 4; i++) {
             if (i) cout << '.';
             cout << static_cast<int>(ip->v4[i]);
         }
     }
     else {
-        // colon-hex groups
         for (int i = 0; i < 16; i += 2) {
             if (i) cout << ':';
             cout << hex[(ip->v6[i] >> 4) & 0xF] << hex[ip->v6[i] & 0xF]
@@ -934,11 +1024,7 @@ static const char* ether_proto_name(EtherProto p) {
 }
 
 static void print_l2(const optional<L2Info>& l2) {
-    if (!l2) {
-        cout << " | no L2";
-        return;
-    }
-
+    if (!l2) { cout << " | no L2"; return; }
     cout << " | ";
     print_mac(l2->dst_mac, "dst");
     cout << "  ";
@@ -957,29 +1043,19 @@ static const char* proto_name(IPProto p) {
 }
 
 static void print_l3(const optional<L3Info>& l3) {
-    if (!l3) {
-        cout << " | no L3";
-        return;
-    }
-
+    if (!l3) { cout << " | no L3"; return; }
     cout << " | ";
     print_ip(l3->src_ip, "src");
     cout << "  ";
     print_ip(l3->dst_ip, "dst");
-
     cout << " | proto: " << proto_name(l3->proto)
          << " ttl: " << static_cast<int>(l3->ttl)
          << " total_len: " << l3->total_len;
 }
 
 static void print_l4(const unique_ptr<L4Info>& l4) {
-    if (!l4) {
-        cout << " | no L4";
-        return;
-    }
-
+    if (!l4) { cout << " | no L4"; return; }
     cout << " | ";
-
     switch (l4->protocol) {
         case IPProto::TCP: {
             const auto& t = static_cast<const TcpL4Info&>(*l4);
@@ -998,25 +1074,21 @@ static void print_l4(const unique_ptr<L4Info>& l4) {
         }
         case IPProto::UDP: {
             const auto& u = static_cast<const UdpL4Info&>(*l4);
-            cout << "UDP " << u.src_port << " -> " << u.dst_port
-                 << " len=" << u.length;
+            cout << "UDP " << u.src_port << " -> " << u.dst_port << " len=" << u.length;
             break;
         }
         case IPProto::ICMP: {
             const auto& i = static_cast<const IcmpL4Info&>(*l4);
-            cout << "ICMP type=" << static_cast<int>(i.type)
-                 << " code=" << static_cast<int>(i.code);
+            cout << "ICMP type=" << static_cast<int>(i.type) << " code=" << static_cast<int>(i.code);
             break;
         }
         case IPProto::ICMPv6: {
             const auto& i = static_cast<const ICMPv6L4Info&>(*l4);
-            cout << "ICMPv6 type=" << static_cast<int>(i.type)
-                 << " code=" << static_cast<int>(i.code);
+            cout << "ICMPv6 type=" << static_cast<int>(i.type) << " code=" << static_cast<int>(i.code);
             break;
         }
         default:
             cout << "unknown L4";
-            break;
     }
 }
 
@@ -1031,13 +1103,8 @@ static const char* tls_content_type_name(TlsContentType ct) {
 }
 
 static void print_l5(const unique_ptr<L5Info>& l5) {
-    if (!l5) {
-        cout << " | no L5";
-        return;
-    }
-
+    if (!l5) { cout << " | no L5"; return; }
     cout << " | ";
-
     switch (l5->protocol) {
         case L5Proto::HTTP: {
             const auto& h = static_cast<const HttpL5Info&>(*l5);
@@ -1052,19 +1119,19 @@ static void print_l5(const unique_ptr<L5Info>& l5) {
             cout << "TLS " << tls_content_type_name(t.content_type)
                  << " v" << static_cast<int>(t.version_major) << "." << static_cast<int>(t.version_minor)
                  << " len=" << t.record_len;
+            if (!t.sni.empty())
+                cout << " sni=" << t.sni;
             break;
         }
         case L5Proto::DNS: {
             const auto& d = static_cast<const DnsL5Info&>(*l5);
             cout << "DNS id=" << d.id
                  << (d.is_response ? " QR=response" : " QR=query")
-                 << " qd=" << d.qdcount
-                 << " an=" << d.ancount;
+                 << " qd=" << d.qdcount << " an=" << d.ancount;
             break;
         }
         default:
             cout << "unknown L5";
-            break;
     }
 }
 
@@ -1082,27 +1149,66 @@ int main() {
     L3ParserRegistry l3_registry;
     L4ParserRegistry l4_registry;
     L5ParserRegistry l5_registry;
+    RttTracker rtt_tracker;
 
     const uint8_t* data;
     size_t size;
 
-    int dlt = pkt_src.getLinkType(); // data link type will be the same for all packets on a given interface
+    int dlt = pkt_src.getLinkType();
     int packet_id = 1;
     double start = now();
+
+    // open capture file
+    string pcap_path = "capture.pcap";
+    PcapWriter pcap_writer(pcap_path, dlt);
+    if (pcap_writer.is_ok())
+        cout << "Writing capture to: " << pcap_path << endl;
+    else
+        cout << "Warning: could not open capture file for writing" << endl;
 
     vector<Packet> packets;
 
     cout << "================== CAPTURE SESSION STARTED ==================" << endl;
     while (true) {
         if (pkt_src.getPacket(data, size)) {
-            cout << "Packet (" << size << " bytes) received at "
-                << now() - start << " seconds";
+            double t = now() - start;
 
-            Packet pkt(data, size, now() - start, packet_id++);
+            cout << "Packet (" << size << " bytes) received at " << t << " seconds";
+
+            Packet pkt(data, size, t, packet_id++);
+
+            // write raw bytes before stripping
+            pcap_writer.write_packet(pkt.raw, now());
+
             pkt.stripL2(l2_registry, dlt);
             pkt.stripL3(l3_registry);
             pkt.stripL4(l4_registry);
             pkt.stripL5(l5_registry);
+
+            // RTT tracking for TCP
+            if (pkt.l4 && pkt.l4->protocol == IPProto::TCP && pkt.l3) {
+                const auto& tcp = static_cast<const TcpL4Info&>(*pkt.l4);
+
+                if (pkt.l3->src_ip && pkt.l3->dst_ip) {
+                    FlowKey fwd{*pkt.l3->src_ip, *pkt.l3->dst_ip, tcp.src_port, tcp.dst_port};
+
+                    // record outgoing seq
+                    if (tcp.syn() || pkt.data.size() > 0)
+                        rtt_tracker.record_seq(fwd, tcp.seq, now());    
+
+                    // measure RTT from incoming ACK
+                    if (tcp.ack_f()) {
+                        FlowKey rev{*pkt.l3->dst_ip, *pkt.l3->src_ip, tcp.dst_port, tcp.src_port};
+                        double sample = rtt_tracker.record_ack(rev, tcp.ack, now());
+                        if (sample > 0)
+                            cout << " | rtt_sample=" << (sample * 1000.0) << "ms";
+
+                        auto srtt = rtt_tracker.get_srtt(rev);
+                        if (srtt)
+                            cout << " srtt=" << (*srtt * 1000.0) << "ms";
+                    }
+                }
+            }
 
             if (!pkt.l2)
                 cout << " | unknown link type " << dlt;
